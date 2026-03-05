@@ -3,6 +3,7 @@ use http_body_util::{BodyExt, Full};
 use http_body_util::combinators::BoxBody;
 use hyper::{Request, Response};
 use hyper::service::service_fn;
+use hyper_tls::HttpsConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoBuilder;
@@ -24,35 +25,46 @@ fn boxed_full(body: Full<Bytes>) -> BoxBody<Bytes, hyper::Error> {
     body.map_err(|never| match never {}).boxed()
 }
 
+fn error_body(msg: &str) -> BoxBody<Bytes, hyper::Error> {
+    boxed_full(Full::new(Bytes::copy_from_slice(msg.as_bytes())))
+}
+
 pub async fn run_proxy(
     config: ProxyConfig,
     event_tx: tokio::sync::mpsc::Sender<ProxyEvent>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     let addr = format!("{}:{}", config.bind_addr, config.bind_port);
+    eprintln!("[proxy] binding to {addr}");
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
+            eprintln!("[proxy] bind error: {e}");
             let _ = event_tx.send(ProxyEvent::Error(format!("Bind error: {e}"))).await;
             return;
         }
     };
+    eprintln!("[proxy] listening on {addr}, upstream = {}", config.upstream_url);
     let _ = event_tx.send(ProxyEvent::Started).await;
 
     let upstream_url = Arc::new(config.upstream_url.clone());
-    let client: Arc<Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>> =
-        Arc::new(Client::builder(TokioExecutor::new()).build_http());
+    // HTTPS-capable connector (falls back to plain HTTP automatically)
+    let https = HttpsConnector::new();
+    let client: Arc<Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Full<Bytes>>> =
+        Arc::new(Client::builder(TokioExecutor::new()).build(https));
     let counter = Arc::new(AtomicUsize::new(0));
 
     loop {
         tokio::select! {
             _ = &mut stop_rx => {
+                eprintln!("[proxy] stop signal received");
                 let _ = event_tx.send(ProxyEvent::Stopped).await;
                 break;
             }
             result = listener.accept() => {
                 match result {
-                    Ok((stream, _)) => {
+                    Ok((stream, peer)) => {
+                        eprintln!("[proxy] accepted connection from {peer}");
                         let io = TokioIo::new(stream);
                         let upstream_url = Arc::clone(&upstream_url);
                         let client = Arc::clone(&client);
@@ -69,38 +81,32 @@ pub async fn run_proxy(
                                     handle_request(req, upstream_url, client, event_tx, id).await
                                 }
                             });
-                            let _ = AutoBuilder::new(TokioExecutor::new())
+                            if let Err(e) = AutoBuilder::new(TokioExecutor::new())
                                 .serve_connection(io, svc)
-                                .await;
+                                .await
+                            {
+                                eprintln!("[proxy] connection error: {e}");
+                            }
                         });
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        eprintln!("[proxy] accept error: {e}");
+                        break;
+                    }
                 }
             }
         }
     }
 }
 
-fn error_response(msg: String) -> Response<BoxBody<Bytes, hyper::Error>> {
-    Response::builder()
-        .status(502)
-        .body(boxed_full(Full::new(Bytes::from(msg))))
-        .unwrap()
-}
-
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     upstream_url: Arc<String>,
-    client: Arc<Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>>,
+    client: Arc<Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Full<Bytes>>>,
     event_tx: tokio::sync::mpsc::Sender<ProxyEvent>,
     id: usize,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
     let (parts, body) = req.into_parts();
-    let body_bytes = match body.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(e) => return Ok(error_response(format!("Body read error: {e}"))),
-    };
-
     let method = parts.method.to_string();
     let path = parts
         .uri
@@ -108,6 +114,29 @@ async fn handle_request(
         .map(|pq| pq.as_str())
         .unwrap_or("/")
         .to_string();
+    eprintln!("[proxy] #{id} {method} {path} -> {upstream_url}");
+
+    // ── Read request body ─────────────────────────────────────────────────
+    let body_bytes = match body.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => {
+            let msg = format!("Body read error: {e}");
+            eprintln!("[proxy] #{id} {msg}");
+            let entry = ProxyEntry {
+                id, method, path,
+                request_headers: vec![],
+                request_body: String::new(),
+                response_status: 502,
+                response_headers: vec![],
+                response_body: msg.clone(),
+                timestamp: std::time::SystemTime::now(),
+            };
+            let _ = event_tx.send(ProxyEvent::Entry(Box::new(entry))).await;
+            let resp = Response::builder().status(502).body(error_body(&msg)).unwrap();
+            return Ok(resp);
+        }
+    };
+
     let req_headers: Vec<(String, String)> = parts
         .headers
         .iter()
@@ -115,7 +144,15 @@ async fn handle_request(
         .collect();
     let req_body_str = bytes_to_string(&body_bytes);
 
-    let upstream_uri = format!("{}{}", upstream_url, path);
+    // ── Build upstream request ────────────────────────────────────────────
+    // Ensure path starts with '/' so the joined URI is always well-formed.
+    let path_with_slash = if path.starts_with('/') {
+        path.clone()
+    } else {
+        format!("/{path}")
+    };
+    let upstream_uri = format!("{}{}", upstream_url.trim_end_matches('/'), path_with_slash);
+    eprintln!("[proxy] #{id} forwarding to {upstream_uri}");
 
     let mut upstream_builder = Request::builder()
         .method(&parts.method)
@@ -131,16 +168,51 @@ async fn handle_request(
                 upstream_builder.header(hyper::header::HOST, authority.as_str());
         }
     }
+
     let upstream_req = match upstream_builder.body(Full::new(body_bytes)) {
         Ok(r) => r,
-        Err(e) => return Ok(error_response(format!("Request build error: {e}"))),
+        Err(e) => {
+            let msg = format!("Request build error: {e}");
+            eprintln!("[proxy] #{id} {msg}");
+            let entry = ProxyEntry {
+                id, method, path,
+                request_headers: req_headers,
+                request_body: req_body_str,
+                response_status: 502,
+                response_headers: vec![],
+                response_body: msg.clone(),
+                timestamp: std::time::SystemTime::now(),
+            };
+            let _ = event_tx.send(ProxyEvent::Entry(Box::new(entry))).await;
+            let resp = Response::builder().status(502).body(error_body(&msg)).unwrap();
+            return Ok(resp);
+        }
     };
 
+    // ── Send to upstream ──────────────────────────────────────────────────
     let response = match client.request(upstream_req).await {
         Ok(r) => r,
-        Err(e) => return Ok(error_response(format!("Upstream error: {e}"))),
+        Err(e) => {
+            let msg = format!("Upstream error: {e}");
+            eprintln!("[proxy] #{id} {msg}");
+            let entry = ProxyEntry {
+                id, method, path,
+                request_headers: req_headers,
+                request_body: req_body_str,
+                response_status: 502,
+                response_headers: vec![],
+                response_body: msg.clone(),
+                timestamp: std::time::SystemTime::now(),
+            };
+            let _ = event_tx.send(ProxyEvent::Entry(Box::new(entry))).await;
+            let resp = Response::builder().status(502).body(error_body(&msg)).unwrap();
+            return Ok(resp);
+        }
     };
+
+    // ── Read response ─────────────────────────────────────────────────────
     let status = response.status().as_u16();
+    eprintln!("[proxy] #{id} upstream responded {status}");
     let resp_headers: Vec<(String, String)> = response
         .headers()
         .iter()
@@ -149,7 +221,22 @@ async fn handle_request(
     let (resp_parts, resp_body) = response.into_parts();
     let resp_bytes = match resp_body.collect().await {
         Ok(c) => c.to_bytes(),
-        Err(e) => return Ok(error_response(format!("Response body error: {e}"))),
+        Err(e) => {
+            let msg = format!("Response body error: {e}");
+            eprintln!("[proxy] #{id} {msg}");
+            let entry = ProxyEntry {
+                id, method, path,
+                request_headers: req_headers,
+                request_body: req_body_str,
+                response_status: 502,
+                response_headers: resp_headers,
+                response_body: msg.clone(),
+                timestamp: std::time::SystemTime::now(),
+            };
+            let _ = event_tx.send(ProxyEvent::Entry(Box::new(entry))).await;
+            let resp = Response::builder().status(502).body(error_body(&msg)).unwrap();
+            return Ok(resp);
+        }
     };
     let resp_body_str = bytes_to_string(&resp_bytes);
 
@@ -164,6 +251,7 @@ async fn handle_request(
         response_body: resp_body_str,
         timestamp: std::time::SystemTime::now(),
     };
+    eprintln!("[proxy] #{id} emitting entry to UI");
     let _ = event_tx.send(ProxyEvent::Entry(Box::new(entry))).await;
 
     Ok(Response::from_parts(
