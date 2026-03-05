@@ -49,7 +49,8 @@ pub struct App {
     event_rx: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<ProxyEvent>>>>,
     subscription_id: u64,
     entries: Vec<ProxyEntry>,
-    selected_entry: Option<usize>,
+    /// Index into `entries` of the currently-selected item.
+    selected_index: Option<usize>,
     status_message: String,
 }
 
@@ -60,7 +61,10 @@ pub enum Message {
     BindPortChanged(String),
     StartServer,
     StopServer,
+    /// Select the entry at the given vec index.
     SelectEntry(usize),
+    /// Remove the entry at the given vec index.
+    RemoveEntry(usize),
     ProxyEvent(ProxyEvent),
 }
 
@@ -76,7 +80,7 @@ impl App {
                 event_rx: None,
                 subscription_id: 0,
                 entries: Vec::new(),
-                selected_entry: None,
+                selected_index: None,
                 status_message: "Ready".to_string(),
             },
             Task::none(),
@@ -119,8 +123,24 @@ impl App {
                 self.server_running = false;
                 self.status_message = "Stopped".to_string();
             }
-            Message::SelectEntry(id) => {
-                self.selected_entry = Some(id);
+            Message::SelectEntry(idx) => {
+                if idx < self.entries.len() {
+                    self.selected_index = Some(idx);
+                } else {
+                    eprintln!("[app] SelectEntry: index {idx} out of bounds (len={})", self.entries.len());
+                }
+            }
+            Message::RemoveEntry(idx) => {
+                if idx < self.entries.len() {
+                    self.entries.remove(idx);
+                    self.selected_index = match self.selected_index {
+                        Some(sel) if sel == idx => None,
+                        Some(sel) if sel > idx => Some(sel - 1),
+                        other => other,
+                    };
+                } else {
+                    eprintln!("[app] RemoveEntry: index {idx} out of bounds (len={})", self.entries.len());
+                }
             }
             Message::ProxyEvent(event) => match event {
                 ProxyEvent::Entry(entry) => {
@@ -184,25 +204,41 @@ impl App {
         .align_y(iced::Alignment::Center);
 
         // ── Request list (left pane) ────────────────────────────────────────
-        let entry_list: Column<Message> =
-            self.entries.iter().fold(column![].spacing(2), |col, entry| {
+        // Selection is keyed by the *vec index*, not entry.id, so IDs that
+        // repeat across server restarts never collide.
+        let entry_list: Column<Message> = self
+            .entries
+            .iter()
+            .enumerate()
+            .fold(column![].spacing(2), |col, (idx, entry)| {
                 let label = format!(
                     "[{}] {} {} {}",
                     entry.id, entry.method, entry.path, entry.response_status
                 );
-                let selected = self.selected_entry == Some(entry.id);
-                let btn = button(text(label).size(13))
-                    .on_press(Message::SelectEntry(entry.id))
+                let selected = self.selected_index == Some(idx);
+
+                let select_btn = button(text(label).size(13))
+                    .on_press(Message::SelectEntry(idx))
                     .padding(4)
                     .width(Length::Fill);
+
+                let remove_btn = button(text("×").size(13))
+                    .on_press(Message::RemoveEntry(idx))
+                    .padding(4);
+
+                let item_row = row![select_btn, remove_btn]
+                    .spacing(2)
+                    .align_y(iced::Alignment::Center)
+                    .width(Length::Fill);
+
                 if selected {
                     col.push(
-                        container(btn)
+                        container(item_row)
                             .style(container::rounded_box)
                             .width(Length::Fill),
                     )
                 } else {
-                    col.push(btn)
+                    col.push(item_row)
                 }
             });
 
@@ -214,8 +250,9 @@ impl App {
         .padding(5);
 
         // ── Detail pane (right pane) ────────────────────────────────────────
-        let detail: Element<Message> = if let Some(sel_id) = self.selected_entry {
-            if let Some(entry) = self.entries.iter().find(|e| e.id == sel_id) {
+        // Look up by vec index so the correct entry is always shown.
+        let detail: Element<Message> =
+            if let Some(entry) = self.selected_index.and_then(|i| self.entries.get(i)) {
                 let req_headers_text = entry
                     .request_headers
                     .iter()
@@ -247,10 +284,7 @@ impl App {
                 .into()
             } else {
                 text("Select a request to inspect").into()
-            }
-        } else {
-            text("Select a request to inspect").into()
-        };
+            };
 
         let right_pane = container(detail)
             .width(Length::FillPortion(3))
