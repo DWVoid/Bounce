@@ -11,10 +11,8 @@ use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use tokio::net::TcpListener;
 use crate::types::{ProxyConfig, ProxyEntry, ProxyEvent};
 
-const MAX_BODY: usize = 1024 * 1024; // 1 MB
-
-fn bytes_to_string(b: &Bytes) -> String {
-    if b.len() > MAX_BODY {
+fn bytes_to_string(b: &Bytes, max_body: usize) -> String {
+    if b.len() > max_body {
         format!("[truncated {} bytes]", b.len())
     } else {
         String::from_utf8_lossy(b).to_string()
@@ -48,6 +46,7 @@ pub async fn run_proxy(
     let _ = event_tx.send(ProxyEvent::Started).await;
 
     let upstream_url = Arc::new(config.upstream_url.clone());
+    let max_body_bytes = config.max_body_bytes;
     // HTTPS-capable connector (falls back to plain HTTP automatically)
     let https = HttpsConnector::new();
     let client: Arc<Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Full<Bytes>>> =
@@ -78,7 +77,7 @@ pub async fn run_proxy(
                                 let event_tx = event_tx.clone();
                                 let id = counter.fetch_add(1, Ordering::Relaxed);
                                 async move {
-                                    handle_request(req, upstream_url, client, event_tx, id).await
+                                    handle_request(req, upstream_url, client, event_tx, id, max_body_bytes).await
                                 }
                             });
                             if let Err(e) = AutoBuilder::new(TokioExecutor::new())
@@ -105,6 +104,7 @@ async fn handle_request(
     client: Arc<Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Full<Bytes>>>,
     event_tx: tokio::sync::mpsc::Sender<ProxyEvent>,
     id: usize,
+    max_body: usize,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>, std::convert::Infallible> {
     let (parts, body) = req.into_parts();
     let method = parts.method.to_string();
@@ -142,7 +142,7 @@ async fn handle_request(
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("<binary>").to_string()))
         .collect();
-    let req_body_str = bytes_to_string(&body_bytes);
+    let req_body_str = bytes_to_string(&body_bytes, max_body);
 
     // ── Build upstream request ────────────────────────────────────────────
     // Ensure path starts with '/' so the joined URI is always well-formed.
@@ -238,7 +238,7 @@ async fn handle_request(
             return Ok(resp);
         }
     };
-    let resp_body_str = bytes_to_string(&resp_bytes);
+    let resp_body_str = bytes_to_string(&resp_bytes, max_body);
 
     let entry = ProxyEntry {
         id,

@@ -5,6 +5,9 @@ use iced::widget::{button, column, container, row, scrollable, text, text_input,
 use iced::{Element, Length, Subscription, Task};
 use crate::types::{ProxyEntry, ProxyEvent};
 
+const DEFAULT_MAX_ENTRIES: usize = 200;
+const DEFAULT_MAX_BODY: usize = 1024 * 1024; // 1 MB
+
 /// Passed to `Subscription::run_with`; hashed by `id` so the subscription
 /// is replaced whenever the server is restarted.
 struct SubData {
@@ -44,6 +47,10 @@ pub struct App {
     upstream_url: String,
     bind_addr: String,
     bind_port: String,
+    /// Maximum number of entries to keep in the list (oldest are dropped).
+    max_entries: String,
+    /// Maximum bytes to capture per body before truncating.
+    max_body_bytes: String,
     server_running: bool,
     stop_sender: Option<tokio::sync::oneshot::Sender<()>>,
     event_rx: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<ProxyEvent>>>>,
@@ -59,6 +66,8 @@ pub enum Message {
     UpstreamUrlChanged(String),
     BindAddrChanged(String),
     BindPortChanged(String),
+    MaxEntriesChanged(String),
+    MaxBodyChanged(String),
     StartServer,
     StopServer,
     /// Select the entry at the given vec index.
@@ -75,6 +84,8 @@ impl App {
                 upstream_url: "http://localhost:8080".to_string(),
                 bind_addr: "0.0.0.0".to_string(),
                 bind_port: "3000".to_string(),
+                max_entries: DEFAULT_MAX_ENTRIES.to_string(),
+                max_body_bytes: DEFAULT_MAX_BODY.to_string(),
                 server_running: false,
                 stop_sender: None,
                 event_rx: None,
@@ -87,11 +98,26 @@ impl App {
         )
     }
 
+    fn parsed_max_entries(&self) -> usize {
+        self.max_entries
+            .parse::<usize>()
+            .unwrap_or(DEFAULT_MAX_ENTRIES)
+            .max(1)
+    }
+
+    fn parsed_max_body(&self) -> usize {
+        self.max_body_bytes
+            .parse::<usize>()
+            .unwrap_or(DEFAULT_MAX_BODY)
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::UpstreamUrlChanged(v) => self.upstream_url = v,
             Message::BindAddrChanged(v) => self.bind_addr = v,
             Message::BindPortChanged(v) => self.bind_port = v,
+            Message::MaxEntriesChanged(v) => self.max_entries = v,
+            Message::MaxBodyChanged(v) => self.max_body_bytes = v,
             Message::StartServer => {
                 let port: u16 = match self.bind_port.parse() {
                     Ok(p) => p,
@@ -106,6 +132,7 @@ impl App {
                     upstream_url: self.upstream_url.clone(),
                     bind_addr: self.bind_addr.clone(),
                     bind_port: port,
+                    max_body_bytes: self.parsed_max_body(),
                 };
                 let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
                 let (event_tx, event_rx) = tokio::sync::mpsc::channel(256);
@@ -145,6 +172,17 @@ impl App {
             Message::ProxyEvent(event) => match event {
                 ProxyEvent::Entry(entry) => {
                     self.entries.push(*entry);
+                    // Trim oldest entries to stay within the configured limit.
+                    let max = self.parsed_max_entries();
+                    if self.entries.len() > max {
+                        let excess = self.entries.len() - max;
+                        self.entries.drain(0..excess);
+                        self.selected_index = match self.selected_index {
+                            Some(sel) if sel < excess => None,
+                            Some(sel) => Some(sel - excess),
+                            None => None,
+                        };
+                    }
                 }
                 ProxyEvent::Error(e) => {
                     self.status_message = format!("Error: {e}");
@@ -203,6 +241,25 @@ impl App {
         .spacing(8)
         .align_y(iced::Alignment::Center);
 
+        // ── Settings row ────────────────────────────────────────────────────
+        let max_entries_input = text_input("200", &self.max_entries)
+            .on_input(Message::MaxEntriesChanged)
+            .padding(5)
+            .width(80);
+        let max_body_input = text_input("1048576", &self.max_body_bytes)
+            .on_input(Message::MaxBodyChanged)
+            .padding(5)
+            .width(120);
+
+        let settings_row = row![
+            text("Max entries:").size(14),
+            max_entries_input,
+            text("Max body (bytes):").size(14),
+            max_body_input,
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
         // ── Request list (left pane) ────────────────────────────────────────
         // Selection is keyed by the *vec index*, not entry.id, so IDs that
         // repeat across server restarts never collide.
@@ -226,8 +283,9 @@ impl App {
                     .on_press(Message::RemoveEntry(idx))
                     .padding(4);
 
+                // spacing(0): close button is flush against the label button — no gap.
                 let item_row = row![select_btn, remove_btn]
-                    .spacing(2)
+                    .spacing(0)
                     .align_y(iced::Alignment::Center)
                     .width(Length::Fill);
 
@@ -294,6 +352,7 @@ impl App {
         // ── Full layout ─────────────────────────────────────────────────────
         column![
             config_row,
+            settings_row,
             row![left_pane, right_pane]
                 .height(Length::Fill)
                 .spacing(5),

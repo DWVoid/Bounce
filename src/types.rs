@@ -18,6 +18,8 @@ pub struct ProxyConfig {
     pub upstream_url: String,
     pub bind_addr: String,
     pub bind_port: u16,
+    /// Maximum number of bytes to capture per request/response body.
+    pub max_body_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
