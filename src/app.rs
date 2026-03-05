@@ -2,6 +2,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use futures::SinkExt;
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Column};
+use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::{Element, Length, Subscription, Task};
 use crate::types::{ProxyEntry, ProxyEvent};
 
@@ -74,6 +75,8 @@ pub enum Message {
     SelectEntry(usize),
     /// Remove the entry at the given vec index.
     RemoveEntry(usize),
+    /// Copy the currently-selected entry's full detail to the system clipboard.
+    CopyToClipboard,
     ProxyEvent(ProxyEvent),
 }
 
@@ -167,6 +170,12 @@ impl App {
                     };
                 } else {
                     eprintln!("[app] RemoveEntry: index {idx} out of bounds (len={})", self.entries.len());
+                }
+            }
+            Message::CopyToClipboard => {
+                if let Some(entry) = self.selected_index.and_then(|i| self.entries.get(i)) {
+                    let text = format_entry_for_clipboard(entry);
+                    return iced::clipboard::write(text);
                 }
             }
             Message::ProxyEvent(event) => match event {
@@ -301,7 +310,10 @@ impl App {
             });
 
         let left_pane = container(
-            scrollable(entry_list.width(Length::Fill)).height(Length::Fill),
+            scrollable(entry_list.width(Length::Fill))
+                .height(Length::Fill)
+                // Give content room so the vertical scrollbar doesn't overlap items.
+                .direction(Direction::Vertical(Scrollbar::new().spacing(2))),
         )
         .width(Length::FillPortion(2))
         .height(Length::Fill)
@@ -324,7 +336,21 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("\n");
 
-                scrollable(
+                let detail_header = row![
+                    text(format!(
+                        "[{}] {} {} {}",
+                        entry.id, entry.method, entry.path, entry.response_status
+                    ))
+                    .size(13)
+                    .width(Length::Fill),
+                    button(text("Copy").size(13))
+                        .on_press(Message::CopyToClipboard)
+                        .padding(4),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center);
+
+                let detail_body = scrollable(
                     column![
                         text("Request Headers").size(14),
                         container(text(req_headers_text).size(12)).padding(5),
@@ -339,7 +365,13 @@ impl App {
                     .padding(5),
                 )
                 .height(Length::Fill)
-                .into()
+                // Give content room so the vertical scrollbar doesn't overlap text.
+                .direction(Direction::Vertical(Scrollbar::new().spacing(2)));
+
+                column![detail_header, detail_body]
+                    .spacing(4)
+                    .height(Length::Fill)
+                    .into()
             } else {
                 text("Select a request to inspect").into()
             };
@@ -373,6 +405,46 @@ impl App {
             Subscription::none()
         }
     }
+}
+
+fn format_entry_for_clipboard(entry: &ProxyEntry) -> String {
+    let req_headers = if entry.request_headers.is_empty() {
+        "(none)".to_string()
+    } else {
+        entry
+            .request_headers
+            .iter()
+            .map(|(k, v)| format!("  {k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let resp_headers = if entry.response_headers.is_empty() {
+        "(none)".to_string()
+    } else {
+        entry
+            .response_headers
+            .iter()
+            .map(|(k, v)| format!("  {k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let req_body = if entry.request_body.is_empty() { "(empty)" } else { &entry.request_body };
+    let resp_body = if entry.response_body.is_empty() { "(empty)" } else { &entry.response_body };
+
+    let mut out = String::new();
+    out.push_str("=== Request ===\n");
+    out.push_str(&format!("{} {}\n", entry.method, entry.path));
+    out.push_str("\n--- Request Headers ---\n");
+    out.push_str(&req_headers);
+    out.push_str("\n\n--- Request Body ---\n");
+    out.push_str(req_body);
+    out.push_str("\n\n=== Response ===\n");
+    out.push_str(&format!("Status: {}\n", entry.response_status));
+    out.push_str("\n--- Response Headers ---\n");
+    out.push_str(&resp_headers);
+    out.push_str("\n\n--- Response Body ---\n");
+    out.push_str(resp_body);
+    out
 }
 
 pub fn run_app() -> iced::Result {
