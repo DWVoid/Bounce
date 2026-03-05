@@ -1,0 +1,19 @@
+[package]
+name = "bounce"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bounce"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+hyper-tls = "0.6"
+http-body-util = "0.1"
+bytes = "1"
+native-tls = "0.2"
+iced = { version = "0.14", features = ["tokio"] }
+futures = "0.3"
